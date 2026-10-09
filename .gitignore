@@ -1,0 +1,13 @@
+# never commit captures, images, logs, undo files or anything taken from a real drive
+*.pack
+*.pack.idx
+*.img
+*.log
+*.undo
+*.txt
+*.notstored
+*.json
+__pycache__/
+build*/
+*.o
+*.dSYM/

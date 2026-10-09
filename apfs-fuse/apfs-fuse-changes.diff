@@ -1,0 +1,706 @@
+diff --git a/ApfsLib/ApfsNodeMapper.h b/ApfsLib/ApfsNodeMapper.h
+index b7835f7..a1cb93c 100644
+--- a/ApfsLib/ApfsNodeMapper.h
++++ b/ApfsLib/ApfsNodeMapper.h
+@@ -30,6 +30,13 @@ struct omap_res_t
+ 	paddr_t paddr;
+ };
+ 
++// Recovery fallback: omap mappings salvaged from orphaned omap leaves
++// (see ApfsLs/ApfsOmapScan.cpp). Used when the live omap cannot resolve an oid.
++#include <vector>
++size_t OmapFallbackLoad(const char *path);
++bool OmapFallbackActive();
++void OmapFallbackCandidates(std::vector<omap_res_t> &out, oid_t oid, xid_t xid);
++
+ class ApfsNodeMapper
+ {
+ public:
+diff --git a/ApfsLib/ApfsNodeMapperBTree.cpp b/ApfsLib/ApfsNodeMapperBTree.cpp
+index 2b620c5..3cc7d04 100644
+--- a/ApfsLib/ApfsNodeMapperBTree.cpp
++++ b/ApfsLib/ApfsNodeMapperBTree.cpp
+@@ -21,9 +21,74 @@
+ #include <cstring>
+ #include <iostream>
+ 
++#include <algorithm>
++#include <cinttypes>
++#include <cstdio>
++#include <map>
++
+ #include "ApfsNodeMapperBTree.h"
+ #include "ApfsContainer.h"
+ 
++static std::multimap<oid_t, omap_res_t> g_omap_fallback;
++
++// File format, one mapping per line, hex: oid xid paddr flags size [ignored...]
++size_t OmapFallbackLoad(const char *path)
++{
++	FILE *f = fopen(path, "r");
++	char line[256];
++
++	if (!f)
++		return 0;
++
++	while (fgets(line, sizeof(line), f))
++	{
++		omap_res_t r;
++		uint64_t oid, xid, paddr;
++		unsigned flags, size;
++
++		if (sscanf(line, "%" SCNx64 " %" SCNx64 " %" SCNx64 " %x %x", &oid, &xid, &paddr, &flags, &size) != 5)
++			continue;
++		if (flags & OMAP_VAL_DELETED)
++			continue;
++		r.oid = oid;
++		r.xid = xid;
++		r.paddr = paddr;
++		r.flags = flags;
++		r.size = size;
++		g_omap_fallback.insert(std::make_pair(r.oid, r));
++	}
++	fclose(f);
++
++	return g_omap_fallback.size();
++}
++
++bool OmapFallbackActive()
++{
++	return !g_omap_fallback.empty();
++}
++
++// All salvaged mappings for oid that are not newer than xid, newest first.
++void OmapFallbackCandidates(std::vector<omap_res_t> &out, oid_t oid, xid_t xid)
++{
++	auto range = g_omap_fallback.equal_range(oid);
++
++	for (auto it = range.first; it != range.second; ++it)
++	{
++		const omap_res_t &r = it->second;
++		bool dup = false;
++
++		if (r.xid > xid)
++			continue;
++		for (const omap_res_t &o : out)
++			if (o.paddr == r.paddr && o.xid == r.xid)
++				dup = true;
++		if (!dup)
++			out.push_back(r);
++	}
++
++	std::sort(out.begin(), out.end(), [](const omap_res_t &a, const omap_res_t &b) { return a.xid > b.xid; });
++}
++
+ static int CompareOMapKey(const void *skey, size_t skey_len, const void *ekey, size_t ekey_len, void *context)
+ {
+ 	(void)context;
+@@ -97,7 +162,7 @@ bool ApfsNodeMapperBTree::Lookup(omap_res_t &omr, oid_t oid, xid_t xid)
+ 	if (!m_tree.Lookup(res, &key, sizeof(key), CompareOMapKey, this, false))
+ 	{
+ 		// std::cout << "NOT FOUND" << std::endl;
+-		std::cerr << std::hex << "oid " << oid << " xid " << xid << " NOT FOUND!!!" << std::endl;
++		if (!OmapFallbackActive()) std::cerr << std::hex << "oid " << oid << " xid " << xid << " NOT FOUND!!!" << std::endl;
+ 		return false;
+ 	}
+ 
+@@ -116,7 +181,7 @@ bool ApfsNodeMapperBTree::Lookup(omap_res_t &omr, oid_t oid, xid_t xid)
+ 	if (key.ok_oid != res_key->ok_oid)
+ 	{
+ 		// std::cout << "NOT FOUND" << std::endl;
+-		std::cerr << std::hex << "oid " << oid << " xid " << xid << " NOT FOUND!!!" << std::endl;
++		if (!OmapFallbackActive()) std::cerr << std::hex << "oid " << oid << " xid " << xid << " NOT FOUND!!!" << std::endl;
+ 		omr.oid = oid;
+ 		omr.xid = xid;
+ 		omr.flags = 0;
+diff --git a/ApfsLib/ApfsVolume.cpp b/ApfsLib/ApfsVolume.cpp
+index 6c6ffa5..51706f9 100644
+--- a/ApfsLib/ApfsVolume.cpp
++++ b/ApfsLib/ApfsVolume.cpp
+@@ -392,3 +392,25 @@ int ApfsVolume::CompareSnapMetaKey(const void* skey, size_t skey_len, const void
+ 
+ 	return 0;
+ }
++
++bool ApfsVolume::CryptBlocks(uint8_t *data, uint64_t blkcnt, uint64_t xts_tweak, bool encrypt)
++{
++	constexpr int encryption_block_size = 0x200;
++
++	if (!m_is_encrypted)
++		return true;
++
++	uint64_t cs_factor = m_container.GetBlocksize() / encryption_block_size;
++	uint64_t uno = xts_tweak * cs_factor;
++	size_t size = blkcnt * m_container.GetBlocksize();
++
++	for (size_t k = 0; k < size; k += encryption_block_size)
++	{
++		if (encrypt)
++			m_aes.Encrypt(data + k, data + k, encryption_block_size, uno);
++		else
++			m_aes.Decrypt(data + k, data + k, encryption_block_size, uno);
++		uno++;
++	}
++	return true;
++}
+diff --git a/ApfsLib/ApfsVolume.h b/ApfsLib/ApfsVolume.h
+index a9a8448..85c9247 100644
+--- a/ApfsLib/ApfsVolume.h
++++ b/ApfsLib/ApfsVolume.h
+@@ -44,11 +44,17 @@ public:
+ 
+ 	BTree &fstree() { return m_fs_tree; }
+ 	BTree &fexttree() { return m_fext_tree; }
++	BTree &extentreftree() { return m_extentref_tree; }
++	BTree &snapmetatree() { return m_snap_meta_tree; }
++	const apfs_superblock_t &sb() const { return m_sb; }
+ 	uint32_t getTextFormat() const { return m_sb.apfs_incompatible_features & 0x9; }
+ 
+ 	ApfsContainer &getContainer() const { return m_container; }
+ 
+ 	bool ReadBlocks(uint8_t *data, paddr_t paddr, uint64_t blkcnt, uint64_t xts_tweak);
++	// Recovery helper: en- or decrypt a buffer of whole blocks with the volume key, as if it sat at block 'xts_tweak'.
++	bool CryptBlocks(uint8_t *data, uint64_t blkcnt, uint64_t xts_tweak, bool encrypt);
++	bool isEncrypted() const { return m_is_encrypted; }
+ 	bool isSealed() const { return (m_sb.apfs_incompatible_features & APFS_INCOMPAT_SEALED_VOLUME) != 0; }
+ 
+ private:
+diff --git a/ApfsLib/BTree.cpp b/ApfsLib/BTree.cpp
+index 10c5639..7d3bec9 100644
+--- a/ApfsLib/BTree.cpp
++++ b/ApfsLib/BTree.cpp
+@@ -17,6 +17,7 @@
+ 	along with apfs-fuse.  If not, see <http://www.gnu.org/licenses/>.
+ */
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <cstring>
+ #include <cstdio>
+@@ -31,6 +32,8 @@
+ #include "Util.h"
+ #include "BlockDumper.h"
+ 
++uint64_t g_btree_missing_nodes = 0;
++
+ int CompareStdKey(const void *skey, size_t skey_len, const void *ekey, size_t ekey_len, void *context)
+ {
+ 	// assert(skey_len == 8);
+@@ -245,6 +248,8 @@ bool BTree::Lookup(BTreeEntry &result, const void *key, size_t key_size, BTCompa
+ 			oid = *reinterpret_cast<const oid_t *>(e.val);
+ 		}
+ 
++		const uint16_t parent_level = node->level();
++
+ 		node = GetNode(oid, node, index);
+ 
+ 		if (!node)
+@@ -252,6 +257,15 @@ bool BTree::Lookup(BTreeEntry &result, const void *key, size_t key_size, BTCompa
+ 			std::cerr << "BTree::Lookup: Node " << oid << " with parent " << oid_parent << " not found." << std::endl;
+ 			return false;
+ 		}
++
++		// Recovery: a child must be exactly one level below its parent. A
++		// block holding an unrelated node would otherwise send the descent in
++		// circles.
++		if (node->level() + 1 != parent_level)
++		{
++			std::cerr << "BTree::Lookup: Node " << oid << " with parent " << oid_parent << " has the wrong level." << std::endl;
++			return false;
++		}
+ 	}
+ 
+ 	index = FindBin(node, key, key_size, func, context, exact ? FindMode::EQ : FindMode::LE);
+@@ -416,6 +430,58 @@ void BTree::DumpTreeInternal(BlockDumper& out, const std::shared_ptr<BTreeNode>
+ 	}
+ }
+ 
++// Recovery check for a candidate child block of a file-system tree node:
++// one level below the parent, and its first key inside the parent's range
++// for that child (compared by object id and record type).
++static bool FitsUnderParent(const uint8_t *blk, const std::shared_ptr<BTreeNode> &parent, uint32_t parent_index)
++{
++	const btree_node_phys_t *btn = reinterpret_cast<const btree_node_phys_t *>(blk);
++
++	if (btn->btn_o.o_subtype != OBJECT_TYPE_FSTREE)
++		return true;
++	if (btn->btn_level + 1 != parent->level())
++		return false;
++	if (btn->btn_nkeys == 0 || (btn->btn_flags & BTNODE_FIXED_KV_SIZE))
++		return true;
++
++	BTreeEntry pe;
++	if (!parent->GetEntry(pe, parent_index) || pe.key_len < sizeof(uint64_t))
++		return true;
++
++	// first key of the candidate (variable-size key/value node layout)
++	const size_t toc = sizeof(btree_node_phys_t) + btn->btn_table_space.off;
++	const size_t keys = toc + btn->btn_table_space.len;
++	const kvloc_t *loc = reinterpret_cast<const kvloc_t *>(blk + toc);
++	if (keys + loc->k.off + sizeof(uint64_t) > 4096)
++		return false;
++
++	auto split = [](uint64_t v, uint64_t &id, uint64_t &type) { id = v & OBJ_ID_MASK; type = v >> OBJ_TYPE_SHIFT; };
++	uint64_t cid, ctype, pid, ptype;
++	uint64_t cv, pv;
++	memcpy(&cv, blk + keys + loc->k.off, sizeof(cv));
++	memcpy(&pv, pe.key, sizeof(pv));
++	split(cv, cid, ctype);
++	split(pv, pid, ptype);
++
++	if (cid < pid || (cid == pid && ctype < ptype))
++		return false;
++
++	if (parent_index + 1 < parent->entries_cnt())
++	{
++		BTreeEntry ne;
++		if (parent->GetEntry(ne, parent_index + 1) && ne.key_len >= sizeof(uint64_t))
++		{
++			uint64_t nv, nid, ntype;
++			memcpy(&nv, ne.key, sizeof(nv));
++			split(nv, nid, ntype);
++			if (cid > nid || (cid == nid && ctype > ntype))
++				return false;
++		}
++	}
++
++	return true;
++}
++
+ std::shared_ptr<BTreeNode> BTree::GetNode(oid_t oid, const std::shared_ptr<BTreeNode> &parent, uint32_t parent_index)
+ {
+ 	std::shared_ptr<BTreeNode> node;
+@@ -445,6 +511,8 @@ std::shared_ptr<BTreeNode> BTree::GetNode(oid_t oid, const std::shared_ptr<BTree
+ 
+ 		std::vector<uint8_t> blk;
+ 
++		std::vector<omap_res_t> cands;
++
+ 		if (m_omap)
+ 		{
+ 			rc = m_omap->Lookup(omr, oid, m_xid);
+@@ -453,53 +521,101 @@ std::shared_ptr<BTreeNode> BTree::GetNode(oid_t oid, const std::shared_ptr<BTree
+ 				std::cout << "omap: oid=" << omr.oid << " xid=" << omr.xid << " flags=" << omr.flags << " size=" << omr.size << " paddr=" << omr.paddr << std::endl;
+ 			}
+ 
+-			if (!rc)
++			// Recovery: mappings salvaged from orphaned omap leaves are tried
++			// newest first, next to whatever the live omap returned.
++			if (OmapFallbackActive())
++				OmapFallbackCandidates(cands, oid, m_xid);
++
++			if (rc)
++			{
++				bool dup = false;
++				for (const omap_res_t &c : cands)
++					if (c.paddr == omr.paddr)
++						dup = true;
++				if (!dup)
++				{
++					cands.push_back(omr);
++					std::sort(cands.begin(), cands.end(), [](const omap_res_t &a, const omap_res_t &b) { return a.xid > b.xid; });
++				}
++			}
++
++			if (cands.empty())
+ 			{
+ 				std::cerr << "ERROR: GetNode: omap entry oid " << std::hex << oid << " xid " << m_xid << " not found." << std::endl;
+ 				return node;
+ 			}
+ 		}
++		else
++			cands.push_back(omr);
+ 
+ 		blk.resize(m_container.GetBlocksize());
+ 
+-		if (m_volume)
++		const bool strict = m_omap && OmapFallbackActive();
++		bool loaded = false;
++
++		for (size_t ci = 0; ci < cands.size() && !loaded; ci++)
+ 		{
+-			// TODO: is the crypto_id always equal to the block ID here?
+-			// I think so, the xts id and the block id only differ when the
+-			// volume has been converted from a HFS/FileVault volume, which
+-			// used CoreStorage. After conversions, the block numbers do not
+-			// match anymore, since the CoreStorage data has been removed
+-			// and assigned to the apfs volume. But the metadata is always
+-			// fresh and therefore the ids should match.
+-			if (!m_volume->ReadBlocks(blk.data(), omr.paddr, 1, (omr.flags & OMAP_VAL_ENCRYPTED) ? omr.paddr : 0))
++			omr = cands[ci];
++
++			if (m_volume)
+ 			{
+-				std::cerr << "ERROR: GetNode: ReadBlocks failed!" << std::endl;
+-				return node;
+-			}
++				// TODO: is the crypto_id always equal to the block ID here?
++				// I think so, the xts id and the block id only differ when the
++				// volume has been converted from a HFS/FileVault volume, which
++				// used CoreStorage. After conversions, the block numbers do not
++				// match anymore, since the CoreStorage data has been removed
++				// and assigned to the apfs volume. But the metadata is always
++				// fresh and therefore the ids should match.
++				if (!m_volume->ReadBlocks(blk.data(), omr.paddr, 1, (omr.flags & OMAP_VAL_ENCRYPTED) ? omr.paddr : 0))
++				{
++					std::cerr << "ERROR: GetNode: ReadBlocks failed!" << std::endl;
++					continue;
++				}
+ 
+-			if (!(omr.flags & OMAP_VAL_NOHEADER)) {
+-				if (!VerifyBlock(blk.data(), blk.size()))
++				if (!(omr.flags & OMAP_VAL_NOHEADER)) {
++					if (!VerifyBlock(blk.data(), blk.size()))
++					{
++						if (!strict)
++						{
++							std::cerr << "ERROR: GetNode: VerifyBlock failed!" << std::endl;
++							if (g_debug & Dbg_Errors)
++								DumpHex(std::cerr, blk.data(), blk.size());
++						}
++						continue;
++					}
++					if (strict)
++					{
++						// The block must really be this object at this version.
++						const obj_phys_t *o = reinterpret_cast<const obj_phys_t *>(blk.data());
++						if (o->o_oid != oid || o->o_xid != omr.xid)
++							continue;
++
++						// ... and it must fit where its parent puts it. Blocks of
++						// other file systems stored inside disk images on this
++						// volume can carry the same object id; they do not fit.
++						if (parent && !FitsUnderParent(blk.data(), parent, parent_index))
++							continue;
++					}
++				}
++			}
++			else
++			{
++				if (!m_container.ReadAndVerifyHeaderBlock(blk.data(), omr.paddr))
+ 				{
+-					std::cerr << "ERROR: GetNode: VerifyBlock failed!" << std::endl;
+-					if (g_debug & Dbg_Errors)
+-						DumpHex(std::cerr, blk.data(), blk.size());
+-					return node;
++					std::cerr << "ERROR: GetNode: ReadAndVerifyHeaderBlock failed!" << std::endl;
++					continue;
+ 				}
+-			} else {
+-				/*
+-				std::cout << "BTNode @ " << omr.paddr << ":" << std::endl;
+-				DumpHex(std::cout, blk.data(), blk.size());
+-				std::cout << std::endl;
+-				*/
+ 			}
++
++			loaded = true;
++			if (strict && ci > 0 && (g_debug & Dbg_Errors))
++				std::cerr << "GetNode: oid " << std::hex << oid << " resolved with candidate " << std::dec << ci << " (xid " << omr.xid << ")" << std::endl;
+ 		}
+-		else
++
++		if (!loaded)
+ 		{
+-			if (!m_container.ReadAndVerifyHeaderBlock(blk.data(), omr.paddr))
+-			{
+-				std::cerr << "ERROR: GetNode: ReadAndVerifyHeaderBlock failed!" << std::endl;
+-				return node;
+-			}
++			std::cerr << "ERROR: GetNode: no usable block for oid " << std::hex << oid << " xid " << m_xid << " (" << std::dec << cands.size() << " candidates)" << std::endl;
++			return node;
+ 		}
+ 
+ 		node = BTreeNode::CreateNode(*this, blk.data(), blk.size(), omr.paddr, parent, parent_index);
+@@ -731,29 +847,49 @@ std::shared_ptr<BTreeNode> BTreeIterator::next_node()
+ 		pidx++;
+ 	} while (node && pidx >= node->entries_cnt());
+ 
+-	if (!node)
+-		return std::shared_ptr<BTreeNode>();
++	for (;;) {
++		if (!node)
++			return std::shared_ptr<BTreeNode>();
+ 
+-	while (node->level() > 0) {
+-		node->GetEntry(e, pidx);
++		bool failed = false;
+ 
+-		if (node->flags() & BTNODE_HASHED) {
+-			const btn_index_node_val_t *binv = reinterpret_cast<const btn_index_node_val_t *>(e.val);
+-			oid = binv->binv_child_oid + m_tree->m_oid;
+-		} else {
+-			oid = *reinterpret_cast<const uint64_t *>(e.val);
+-		}
++		while (node->level() > 0) {
++			node->GetEntry(e, pidx);
++
++			if (node->flags() & BTNODE_HASHED) {
++				const btn_index_node_val_t *binv = reinterpret_cast<const btn_index_node_val_t *>(e.val);
++				oid = binv->binv_child_oid + m_tree->m_oid;
++			} else {
++				oid = *reinterpret_cast<const uint64_t *>(e.val);
++			}
+ 
+ #ifdef BTITDBG
+-		std::cout << "  Navigating down to node " << oid << std::endl;
++			std::cout << "  Navigating down to node " << oid << std::endl;
+ #endif
+-		node = m_tree->GetNode(oid, node, pidx);
++			std::shared_ptr<BTreeNode> child = m_tree->GetNode(oid, node, pidx);
++
++			if (!child) {
++				// Recovery: an unreadable subtree is skipped and counted instead
++				// of ending the iteration (or crashing).
++				std::cerr << "Failed to load btree node oid " << oid << ", skipping it" << std::endl;
++				g_btree_missing_nodes++;
++				failed = true;
++				break;
++			}
+ 
+-		if (!node)
+-			std::cerr << "Failed to load btree node oid " << oid << std::endl;
++			node = child;
++			pidx = 0;
++		}
+ 
+-		pidx = 0;
+-	}
++		if (!failed)
++			return node;
+ 
+-	return node;
++		// Move past the unreadable child: next sibling, or up again.
++		pidx++;
++		while (node && pidx >= node->entries_cnt()) {
++			pidx = node->parent_index();
++			node = node->parent();
++			pidx++;
++		}
++	}
+ }
+diff --git a/ApfsLib/BTree.h b/ApfsLib/BTree.h
+index c517ece..41feabe 100644
+--- a/ApfsLib/BTree.h
++++ b/ApfsLib/BTree.h
+@@ -29,6 +29,9 @@
+ 
+ #include "ApfsNodeMapper.h"
+ 
++// Number of B-tree nodes an iterator had to skip because they were unreadable.
++extern uint64_t g_btree_missing_nodes;
++
+ class BTree;
+ class BTreeNode;
+ class BTreeIterator;
+@@ -161,6 +164,13 @@ public:
+ 
+ 	void EnableDebugOutput() { m_debug = true; }
+ 
++	// Read-only access for audit tools: the root node, and node loading with
++	// the same object-map resolution (including recovery fallbacks) as lookups.
++	std::shared_ptr<BTreeNode> AuditRoot() const { return m_root_node; }
++	std::shared_ptr<BTreeNode> AuditGetNode(oid_t oid, const std::shared_ptr<BTreeNode> &parent, uint32_t parent_index) { return GetNode(oid, parent, parent_index); }
++	// Object-map lookup only (no block is read): which version of oid this tree would use.
++	bool AuditOmapLookup(oid_t oid, omap_res_t &omr) { return m_omap && m_omap->Lookup(omr, oid, m_xid); }
++
+ private:
+ 	void DumpTreeInternal(BlockDumper &out, const std::shared_ptr<BTreeNode> &node);
+ 	uint32_t Find(const std::shared_ptr<BTreeNode> &node, const void *key, size_t key_size, BTCompareFunc func, void *context);
+diff --git a/ApfsLib/DeviceMac.cpp b/ApfsLib/DeviceMac.cpp
+index 3d31bc0..d47551c 100644
+--- a/ApfsLib/DeviceMac.cpp
++++ b/ApfsLib/DeviceMac.cpp
+@@ -29,6 +29,8 @@ along with apfs-fuse.  If not, see <http://www.gnu.org/licenses/>.
+ #include <string.h>
+ 
+ #include <iostream>
++#include <cstdlib>
++#include <cstdio>
+ 
+ #include "DeviceMac.h"
+ #include "Global.h"
+@@ -102,6 +104,30 @@ bool DeviceMac::Read(void* data, uint64_t offs, uint64_t len)
+ 
+ 	nread = pread(m_device, data, len, offs);
+ 
++	// Working on a sparse local copy that holds only part of a disk: a read
++	// that lands in a hole returns zeros. With APFS_HOLE_LOG set, every such
++	// read is logged as "byte_offset length" so the missing blocks can be
++	// fetched from the real disk.
++	static const char *hole_log = getenv("APFS_HOLE_LOG");
++	if (hole_log && nread == len)
++	{
++		off_t d = lseek(m_device, (off_t)offs, SEEK_DATA);
++		if (d == -1 || (uint64_t)d >= offs + len || (uint64_t)d > offs)
++		{
++			FILE *f = fopen(hole_log, "a");
++			if (f) { fprintf(f, "%llu %llu\n", (unsigned long long)offs, (unsigned long long)len); fclose(f); }
++		}
++		else
++		{
++			off_t h = lseek(m_device, (off_t)offs, SEEK_HOLE);
++			if (h != -1 && (uint64_t)h < offs + len)
++			{
++				FILE *f = fopen(hole_log, "a");
++				if (f) { fprintf(f, "%llu %llu\n", (unsigned long long)offs, (unsigned long long)len); fclose(f); }
++			}
++		}
++	}
++
+ 	// TODO: Better error handling ...
+ 	return nread == len;
+ }
+diff --git a/ApfsLib/Util.cpp b/ApfsLib/Util.cpp
+index f05de6a..0bd7a6b 100644
+--- a/ApfsLib/Util.cpp
++++ b/ApfsLib/Util.cpp
+@@ -404,7 +404,11 @@ bool GetPassword(std::string &pw)
+ 
+ 	/* Turn echoing off and fail if we can’t. */
+ 	if (tcgetattr (fileno (stream), &told) != 0)
+-		return false;
++	{
++		/* stdin is not a terminal: read the password from the pipe */
++		std::getline(std::cin, pw);
++		return !pw.empty();
++	}
+ 	tnew = told;
+ 	tnew.c_lflag &= ~ECHO;
+ 	if (tcsetattr (fileno (stream), TCSAFLUSH, &tnew) != 0)
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 03acf26..2b1f0ba 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -122,9 +122,10 @@ add_executable(apfs-fuse
+ 	apfsfuse/ApfsFuse.cpp)
+ target_compile_definitions(apfs-fuse PRIVATE _FILE_OFFSET_BITS=64 _DARWIN_USE_64_BIT_INODE)
+ if (APPLE)
+-target_include_directories(apfs-fuse PRIVATE /usr/local/include/osxfuse/)
++target_include_directories(apfs-fuse BEFORE PRIVATE "/Library/Application Support/fuse-t/include")
+ # link_directories(/usr/local/lib/)
+-target_link_libraries(apfs-fuse apfs /usr/local/lib/libosxfuse.dylib)
++target_link_libraries(apfs-fuse apfs "/Library/Application Support/fuse-t/lib/libfuse3.4.dylib")
++set_target_properties(apfs-fuse PROPERTIES BUILD_RPATH "/Library/Application Support/fuse-t/lib")
+ else()
+ if (USE_FUSE3)
+ target_link_libraries(apfs-fuse apfs fuse3)
+@@ -140,3 +141,35 @@ target_link_libraries(apfsutil apfs)
+ include(GNUInstallDirs)
+ install(TARGETS apfs-fuse RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+ install(TARGETS apfsutil RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
++
++add_executable(apfs-ls ApfsLs/ApfsLs.cpp)
++target_link_libraries(apfs-ls apfs)
++
++add_executable(apfs-omapscan ApfsLs/ApfsOmapScan.cpp)
++target_link_libraries(apfs-omapscan apfs)
++
++add_executable(apfs-copy ApfsLs/ApfsCopy.cpp)
++target_link_libraries(apfs-copy apfs)
++
++add_executable(apfs-verify ApfsLs/ApfsVerify.cpp)
++target_link_libraries(apfs-verify apfs)
++
++add_executable(apfs-fsscan ApfsLs/ApfsFsScan.cpp)
++target_link_libraries(apfs-fsscan apfs)
++add_executable(apfs-audit ApfsLs/ApfsAudit.cpp)
++target_link_libraries(apfs-audit apfs)
++
++add_executable(apfs-refs ApfsLs/ApfsRefs.cpp)
++target_link_libraries(apfs-refs apfs)
++
++add_executable(apfs-reloc ApfsLs/ApfsReloc.cpp)
++target_link_libraries(apfs-reloc apfs)
++
++add_executable(apfs-rawscan ApfsLs/ApfsRawScan.cpp)
++target_link_libraries(apfs-rawscan apfs)
++
++add_executable(apfs-snaps ApfsLs/ApfsSnaps.cpp)
++target_link_libraries(apfs-snaps apfs)
++
++add_executable(apfs-snapcheck ApfsLs/ApfsSnapCheck.cpp)
++target_link_libraries(apfs-snapcheck apfs)
+diff --git a/apfsfuse/ApfsFuse.cpp b/apfsfuse/ApfsFuse.cpp
+index bf01558..b6e97bd 100644
+--- a/apfsfuse/ApfsFuse.cpp
++++ b/apfsfuse/ApfsFuse.cpp
+@@ -34,8 +34,8 @@
+ #include <unistd.h>
+ #endif
+ #ifdef __APPLE__
+-#include <fuse/fuse.h>
+-#include <fuse/fuse_lowlevel.h>
++#include <fuse3/fuse.h>
++#include <fuse3/fuse_lowlevel.h>
+ #endif
+ 
+ #include <getopt.h>
+@@ -75,6 +75,7 @@ static bool g_set_gid = false;
+ static int g_physblksize = 512;
+ static std::string g_password;
+ static xid_t g_snap_xid = 0;
++static FILE *g_errlog = nullptr;   // set with -o errlog=PATH
+ 
+ struct Directory
+ {
+@@ -474,12 +475,30 @@ static void apfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, st
+ 		// bool rc;
+ 		std::vector<char> buf(size, 0);
+ 
+-		// rc =
+-		dir.ReadFile(buf.data(), file->ino.private_id, off, size);
++		// Recovery: a failed read is reported as an I/O error (and logged)
++		// instead of silently returning zeros. Reads past the end of the
++		// file are clamped first so they do not count as failures.
++		uint64_t fsize = (file->ino.optional_present_flags & ApfsDir::Inode::INO_HAS_DSTREAM) ? file->ino.ds_size : 0;
++		if (static_cast<uint64_t>(off) >= fsize)
++		{
++			fuse_reply_buf(req, buf.data(), 0);
++			return;
++		}
++		if (off + size > fsize)
++			size = fsize - off;
+ 
+-		// std::cerr << "apfs_read: fuse_reply_buf(req, " << reinterpret_cast<uint64_t>(buf.data()) << ", " << size << ")" << std::endl;
++		if (!dir.ReadFile(buf.data(), file->ino.private_id, off, size))
++		{
++			if (g_errlog)
++			{
++				fprintf(g_errlog, "READ ERROR inode %llu offset %lld size %zu\n", (unsigned long long)ino, (long long)off, size);
++				fflush(g_errlog);
++			}
++			fuse_reply_err(req, EIO);
++			return;
++		}
+ 
+-		fuse_reply_buf(req, buf.data(), buf.size());
++		fuse_reply_buf(req, buf.data(), size);
+ 	}
+ 	else
+ 	{
+@@ -698,6 +717,15 @@ static int apfs_parse_fuse_opt(void *data, const char *arg, int key, struct fuse
+ 			g_password = strchr(arg, '=') + sizeof(char);
+ 			return 0;
+ 		}
++		else if (!strncmp(arg, "errlog=", 7)) {
++			g_errlog = fopen(strchr(arg, '=') + sizeof(char), "a");
++			return 0;
++		}
++		else if (!strncmp(arg, "omap=", 5)) {
++			size_t n = OmapFallbackLoad(strchr(arg, '=') + sizeof(char));
++			std::cout << "Loaded " << n << " salvaged omap mappings." << std::endl;
++			return 0;
++		}
+ 		else if (!strncmp(arg, "xid=", 4)) {
+ 			g_xid = strtoull(strchr(arg, '=') + sizeof(char), nullptr, 10);
+ 			return 0;
+@@ -739,7 +767,7 @@ int main(int argc, char *argv[])
+ 	ops.getxattr = apfs_getxattr;
+ #endif
+ #ifdef __APPLE__
+-	ops.getxattr = apfs_getxattr_mac;
++	// ops.getxattr = apfs_getxattr_mac; // disabled for fuse-t (fuse3 4-arg signature)
+ #endif
+ 	ops.listxattr = apfs_listxattr;
+ 	ops.lookup = apfs_lookup;
