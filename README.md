@@ -2,7 +2,7 @@
 
 Tools written during the recovery and in-place repair of an APFS volume that macOS
 would not mount and that Disk Utility's First Aid declared "corrupt and cannot be
-repaired". The long story is in the blog post [How to save an APFS HDD](https://blog.wangxm.com/?p=5796). This repository holds the
+repaired". The long story is in the blog post [How to save an APFS HDD](https://blog.wangxm.com/2026/10/how-to-save-an-apfs-hdd/). This repository holds the
 code: a patched read-only driver with extra command-line tools, a block-ownership checker
 that catches a class of damage Apple's checker does not, an overlay for rehearsing
 writes, and the repair planners and patchers that were actually used.
